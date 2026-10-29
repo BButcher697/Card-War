@@ -57,24 +57,27 @@ connects to its own origin.
 
 ## Updating the game
 
-After rebuilding in Unity:
+After rebuilding in Unity, run the sync script from the project folder:
 
 ```powershell
+cd "C:\Users\Shathi\Desktop\WC"
 powershell -ExecutionPolicy Bypass -File .\prepare_render_deploy.ps1
+cd render-deploy
 git add .
 git commit -m "Update build"
 git push
 ```
 
-`prepare_render_deploy.ps1` copies only the files `index.html` actually loads and
-skips stale artifacts from older builds. Render redeploys automatically on push.
+The script copies only the files `index.html` actually loads, follows the build's
+current file prefix (`WebGL.*`), removes stale artifacts, and refreshes the
+precompressed `.gz` copies. Render redeploys automatically on push.
 
 ## Notes
 
 - `serve_webgl.py` reads the `PORT` environment variable injected by Render and
   binds to `0.0.0.0`.
 - Precompressed `.gz` files are committed, so a cold start does not spend CPU
-  compressing the 75 MB WASM.
+  compressing the 34 MB WASM.
 - The high-DPI text fix is already baked into `index.html`.
 - Custom domain: Render dashboard → your service → **Settings** → **Custom
   Domains**.
