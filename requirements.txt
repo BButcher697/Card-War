@@ -1,0 +1,1 @@
+# No third-party dependencies: serve_webgl.py uses only the Python standard library.

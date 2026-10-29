@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: card-wars
+    runtime: python
+    plan: free
+    buildCommand: "echo 'No build step required'"
+    startCommand: "python serve_webgl.py"
+    healthCheckPath: /
+    autoDeploy: true
