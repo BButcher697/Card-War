@@ -222,6 +222,17 @@ class Relay:
                 room.broadcast(out, self._send_locked)
             return
 
+        if t == "reaction":
+            try:
+                emoji = int(msg.get("e", -1))
+            except (TypeError, ValueError):
+                emoji = -1
+            if 0 <= emoji < 6:
+                with self.lock:
+                    out = json.dumps({"t": "reaction", "s": seat, "e": emoji})
+                    room.broadcast(out, self._send_locked)
+            return
+
     def _send_locked(self, handler, payload):
         if not isinstance(payload, str):
             payload = json.dumps(payload)
@@ -299,7 +310,7 @@ class GameHandler(http.server.SimpleHTTPRequestHandler):
             if path.endswith(".html") or path.endswith("/") or path.endswith("\\"):
                 self.send_header("Cache-Control", "no-cache, must-revalidate")
             else:
-                self.send_header("Cache-Control", "public, max-age=604800, immutable")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
 
             http.server.SimpleHTTPRequestHandler.end_headers(self)
             return f
@@ -430,7 +441,7 @@ def prepare_gzip_assets(root_path):
     for ext in (".wasm", ".data", ".framework.js"):
         for p in root.rglob("*" + ext):
             gz = p.with_name(p.name + ".gz")
-            if not gz.exists() or gz.stat().st_mtime < p.stat().st_mtime:
+            if not gz.exists() or gz.stat().st_size == 0 or gz.stat().st_mtime < p.stat().st_mtime:
                 try:
                     with open(p, "rb") as f_in, gzip.open(gz, "wb", compresslevel=6) as f_out:
                         f_out.write(f_in.read())
@@ -452,12 +463,31 @@ def local_ip():
 
 
 def default_root():
-    """Support both layouts: project (Build/WebGL) and deploy repo (index.html at root)."""
+    """Support both layouts: project (Build/WebGL) and deploy repo (index.html at root), picking the freshest."""
     here = os.path.dirname(os.path.abspath(__file__))
-    nested = os.path.join(here, "Build", "WebGL")
-    if os.path.isfile(os.path.join(nested, "index.html")):
-        return nested
-    return here
+    parent = os.path.dirname(here)
+    candidates = [
+        os.path.join(parent, "Build"),
+        os.path.join(here, "Build", "WebGL"),
+        os.path.join(here, "Build"),
+        here,
+    ]
+    freshest = None
+    freshest_mtime = -1
+    for c in candidates:
+        idx = os.path.join(c, "index.html")
+        if os.path.isfile(idx):
+            mtime = os.path.getmtime(idx)
+            b_dir = os.path.join(c, "Build")
+            if os.path.isdir(b_dir):
+                for f in os.listdir(b_dir):
+                    fp = os.path.join(b_dir, f)
+                    if os.path.isfile(fp):
+                        mtime = max(mtime, os.path.getmtime(fp))
+            if mtime > freshest_mtime:
+                freshest_mtime = mtime
+                freshest = c
+    return freshest or here
 
 
 def main():
