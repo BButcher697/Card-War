@@ -145,7 +145,23 @@ class Relay:
         })
 
     def _broadcast_lobby(self, room):
-        room.broadcast(self._lobby_payload(room), self._send_locked)
+        left = 0
+        if room.deadline is not None:
+            left = max(0, int(room.deadline - time.time()))
+        host_s = getattr(room, "host_seat", 0)
+        csv = room.players_csv()
+        cnt = len(room.members)
+        for seat, handler in list(room.members.items()):
+            payload = json.dumps({
+                "t": "lobby",
+                "code": room.code,
+                "players": csv,
+                "cnt": cnt,
+                "left": left,
+                "host": host_s,
+                "s": seat,
+            })
+            self._send_locked(handler, payload)
 
     def _start_room(self, room):
         room.started = True
@@ -250,7 +266,7 @@ class Relay:
                 self.rooms[code] = room
                 info["name"] = name
                 info["room_code"] = code
-                payload = json.dumps({"t": "room_created", "code": code})
+                payload = json.dumps({"t": "room_created", "code": code, "s": 0, "host": 0})
                 self._send_locked(handler, payload)
                 self._broadcast_lobby(room)
             return
@@ -278,6 +294,7 @@ class Relay:
                 room.names[seat] = name
                 info["name"] = name
                 info["room_code"] = code
+                self._send_locked(handler, json.dumps({"t": "room_joined", "code": code, "s": seat, "host": getattr(room, "host_seat", 0)}))
                 self._broadcast_lobby(room)
                 # If the lobby timer already expired while the host waited alone, start now.
                 if len(room.members) >= 2 and room.deadline is not None and time.time() >= room.deadline:
@@ -291,7 +308,7 @@ class Relay:
                 room = self.rooms.get(code) if code else None
                 if not room or room.started:
                     return
-                if room.get_seat(handler) != 0:
+                if room.get_seat(handler) != getattr(room, "host_seat", 0):
                     return
                 if len(room.members) < 2:
                     self._send_locked(handler, json.dumps({"t": "room_error", "m": "Need at least 2 players to start."}))
@@ -304,7 +321,7 @@ class Relay:
             with self.lock:
                 code = info.get("room_code")
                 room = self.rooms.get(code) if code else None
-                if room and room.get_seat(handler) == 0:
+                if room and room.get_seat(handler) == getattr(room, "host_seat", 0):
                     self.rooms.pop(code, None)
                     info["room_code"] = None
                     close_msg = json.dumps({"t": "close"})
