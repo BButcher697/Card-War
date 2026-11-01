@@ -34,6 +34,16 @@ class Room:
         self.deadline = time.time() + LOBBY_SECONDS  # None once held (solo past timer)
         self.current_seat = 0
         self.all_seats = [0]  # seat snapshot taken at game start (survives mid-game leaves)
+        self.turn_deadline = None
+
+    def next_seat(self, from_seat):
+        connected = sorted(self.members.keys())
+        if not connected:
+            return 0
+        for s in connected:
+            if s > from_seat:
+                return s
+        return connected[0]
 
     def free_seat(self):
         for s in range(MAX_PLAYERS):
@@ -83,16 +93,34 @@ class Relay:
             time.sleep(0.5)
             with self.lock:
                 for room in list(self.rooms.values()):
-                    if room.started or room.deadline is None:
-                        continue
-                    if time.time() < room.deadline:
-                        continue
-                    if len(room.members) >= 2:
-                        self._start_room(room)
+                    if not room.started:
+                        if room.deadline is None:
+                            continue
+                        if time.time() < room.deadline:
+                            continue
+                        if len(room.members) >= 2:
+                            self._start_room(room)
+                        else:
+                            # Held: no one else arrived. Host can still start when a friend joins.
+                            room.deadline = None
+                            self._broadcast_lobby(room)
                     else:
-                        # Held: no one else arrived. Host can still start when a friend joins.
-                        room.deadline = None
-                        self._broadcast_lobby(room)
+                        # In-game turn timeout check (18s: 15s turn limit + 3s network grace period)
+                        if room.turn_deadline is not None and time.time() >= room.turn_deadline:
+                            if len(room.members) >= 2:
+                                cur_seat = room.current_seat
+                                next_s = room.next_seat(cur_seat)
+                                room.current_seat = next_s
+                                room.turn_deadline = time.time() + 18.0
+                                auto_pass = {
+                                    "t": "move",
+                                    "s": cur_seat,
+                                    "k": "pass",
+                                    "ns": next_s,
+                                    "id": -99,
+                                    "timeout": True,
+                                }
+                                room.broadcast(json.dumps(auto_pass), self._send_locked)
 
     def _lobby_payload(self, room):
         left = 0
@@ -115,6 +143,7 @@ class Relay:
         room.all_seats = sorted(room.members.keys())
         room.seed = random.randint(1, 2147483647)
         room.current_seat = 0
+        room.turn_deadline = time.time() + 18.0
         players = room.players_csv()
         for seat, handler in list(room.members.items()):
             payload = json.dumps({
@@ -166,6 +195,20 @@ class Relay:
                                 if other in self.clients:
                                     self.clients[other]["room_code"] = None
                             self.rooms.pop(code, None)
+                        elif room.current_seat == seat:
+                            # Active player left mid-turn! Advance turn immediately
+                            next_s = room.next_seat(seat)
+                            room.current_seat = next_s
+                            room.turn_deadline = time.time() + 18.0
+                            auto_pass = {
+                                "t": "move",
+                                "s": seat,
+                                "k": "pass",
+                                "ns": next_s,
+                                "id": -98,
+                                "left": True,
+                            }
+                            room.broadcast(json.dumps(auto_pass), self._send_locked)
 
     def _generate_code(self):
         for _ in range(100):
@@ -315,6 +358,7 @@ class Relay:
                 if not isinstance(next_seat, int) or next_seat < 0 or next_seat >= seat_count:
                     next_seat = (seat + 1) % max(2, seat_count)
                 room.current_seat = next_seat
+                room.turn_deadline = time.time() + 18.0
                 out = dict(msg)
                 out["t"] = "move"
                 out["s"] = seat
