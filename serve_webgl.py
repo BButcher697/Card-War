@@ -35,9 +35,12 @@ class Room:
         self.current_seat = 0
         self.all_seats = [0]  # seat snapshot taken at game start (survives mid-game leaves)
         self.turn_deadline = None
+        self.finished_seats = set()
+        self.host_seat = 0
 
     def next_seat(self, from_seat):
-        connected = sorted(self.members.keys())
+        fin = getattr(self, "finished_seats", set())
+        connected = [s for s in sorted(self.members.keys()) if s not in fin]
         if not connected:
             return 0
         for s in connected:
@@ -63,6 +66,10 @@ class Room:
             return None
         self.members.pop(seat, None)
         self.names.pop(seat, None)
+        if hasattr(self, "finished_seats"):
+            self.finished_seats.discard(seat)
+        if seat == getattr(self, "host_seat", 0) and self.members:
+            self.host_seat = min(self.members.keys())
         return seat
 
     def players_csv(self):
@@ -107,7 +114,9 @@ class Relay:
                     else:
                         # In-game turn timeout check (18s: 15s turn limit + 3s network grace period)
                         if room.turn_deadline is not None and time.time() >= room.turn_deadline:
-                            if len(room.members) >= 2:
+                            fin = getattr(room, "finished_seats", set())
+                            active = [s for s in room.members.keys() if s not in fin]
+                            if len(active) >= 2:
                                 cur_seat = room.current_seat
                                 next_s = room.next_seat(cur_seat)
                                 room.current_seat = next_s
@@ -132,6 +141,7 @@ class Relay:
             "players": room.players_csv(),
             "cnt": len(room.members),
             "left": left,
+            "host": getattr(room, "host_seat", 0),
         })
 
     def _broadcast_lobby(self, room):
@@ -140,9 +150,10 @@ class Relay:
     def _start_room(self, room):
         room.started = True
         room.deadline = None
+        room.finished_seats = set()
         room.all_seats = sorted(room.members.keys())
         room.seed = random.randint(1, 2147483647)
-        room.current_seat = 0
+        room.current_seat = sorted(room.members.keys())[0] if room.members else 0
         room.turn_deadline = time.time() + 18.0
         players = room.players_csv()
         for seat, handler in list(room.members.items()):
@@ -191,9 +202,7 @@ class Relay:
                         if len(remaining) <= 1:
                             if remaining:
                                 room.broadcast(json.dumps({"t": "win", "s": remaining[0]}), self._send_locked)
-                            for other in list(room.members.values()):
-                                if other in self.clients:
-                                    self.clients[other]["room_code"] = None
+                        if not room.members:
                             self.rooms.pop(code, None)
                         elif room.current_seat == seat:
                             # Active player left mid-turn! Advance turn immediately
@@ -305,6 +314,45 @@ class Relay:
                             self.clients[other]["room_code"] = None
             return
 
+        # 4b. PLAY AGAIN IN SAME ROOM
+        if t == "play_again":
+            with self.lock:
+                code = info.get("room_code")
+                room = self.rooms.get(code) if code else None
+                if not room:
+                    return
+                seat = room.get_seat(handler)
+                if seat is None:
+                    return
+
+                # Reset room back to lobby mode with 5 minute timer
+                if room.started:
+                    room.started = False
+                    if hasattr(room, "finished_seats"):
+                        room.finished_seats.clear()
+                    room.deadline = time.time() + LOBBY_SECONDS
+                    room.turn_deadline = None
+
+                self._broadcast_lobby(room)
+            return
+
+        # 4c. LEAVE ROOM (Lobby or In-Game)
+        if t in ("leave_room", "leave"):
+            with self.lock:
+                code = info.get("room_code")
+                room = self.rooms.get(code) if code else None
+                if room:
+                    seat = room.remove(handler)
+                    info["room_code"] = None
+                    if seat is not None:
+                        room.broadcast(json.dumps({"t": "player_left", "s": seat}), self._send_locked)
+                        if not room.started:
+                            self._broadcast_lobby(room)
+                    if not room.members:
+                        self.rooms.pop(code, None)
+                self._send_locked(handler, json.dumps({"t": "left_room"}))
+            return
+
         # 5. QUICK MATCH (Random 1v1)
         if t in ("join", "quick_match"):
             name = str(msg.get("n", "Player"))[:24]
@@ -367,9 +415,14 @@ class Relay:
                 room.broadcast(payload, self._send_locked)
             return
 
-        if t == "win":
+        if t in ("player_won", "win"):
             with self.lock:
-                out = json.dumps({"t": "win", "s": seat})
+                place = msg.get("v", 1)
+                is_over = bool(msg.get("left", False))
+                if not hasattr(room, "finished_seats"):
+                    room.finished_seats = set()
+                room.finished_seats.add(seat)
+                out = json.dumps({"t": "player_won", "s": seat, "v": place, "over": is_over})
                 room.broadcast(out, self._send_locked)
             return
 
