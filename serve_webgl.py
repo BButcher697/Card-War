@@ -14,39 +14,60 @@ import socket
 import socketserver
 import struct
 import threading
+import time
 
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+LOBBY_SECONDS = 300
+MAX_PLAYERS = 6
 
 
 class Room:
+    """A private room lobby: host (seat 0) + up to 5 joiners, then a shared game."""
+
     def __init__(self, code, host_handler, host_name="Host"):
         self.code = code
-        self.host = host_handler
-        self.guest = None
-        self.seat_ws = {0: host_handler, 1: None}
-        self.names = {0: host_name, 1: None}
-        self.current_seat = 0
+        self.members = {0: host_handler}  # seat -> handler
+        self.names = {0: host_name}       # seat -> display name
+        self.started = False
         self.seed = None
-        self.matched = False
+        self.deadline = time.time() + LOBBY_SECONDS  # None once held (solo past timer)
+        self.current_seat = 0
+        self.all_seats = [0]  # seat snapshot taken at game start (survives mid-game leaves)
 
-    def get_seat(self, handler):
-        if handler == self.seat_ws.get(0):
-            return 0
-        if handler == self.seat_ws.get(1):
-            return 1
+    def free_seat(self):
+        for s in range(MAX_PLAYERS):
+            if s not in self.members:
+                return s
         return None
 
+    def get_seat(self, handler):
+        for s, h in self.members.items():
+            if h == handler:
+                return s
+        return None
+
+    def remove(self, handler):
+        seat = self.get_seat(handler)
+        if seat is None:
+            return None
+        self.members.pop(seat, None)
+        self.names.pop(seat, None)
+        return seat
+
+    def players_csv(self):
+        return ",".join(self.names.get(s, "") for s in sorted(self.members))
+
     def broadcast(self, payload, send_fn):
-        for s in (0, 1):
-            h = self.seat_ws.get(s)
-            if h:
-                send_fn(h, payload)
+        for h in list(self.members.values()):
+            send_fn(h, payload)
 
 
 class Relay:
     """Multi-room WebSocket relay for Card Wars.
-    Supports private room codes (Create / Join) and Quick Match.
+    Private rooms: create -> share 4-digit code -> lobby (5 min countdown,
+    up to 6 players) -> host starts early or the timer starts the game.
+    Quick Match: instant random 1v1 pairing.
     """
 
     def __init__(self):
@@ -54,6 +75,56 @@ class Relay:
         self.clients = {}         # handler -> {"name": str, "room_code": str|None}
         self.rooms = {}           # code -> Room
         self.quick_waiting = None # handler waiting for quick match
+        self._timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
+        self._timer_thread.start()
+
+    def _timer_loop(self):
+        while True:
+            time.sleep(0.5)
+            with self.lock:
+                for room in list(self.rooms.values()):
+                    if room.started or room.deadline is None:
+                        continue
+                    if time.time() < room.deadline:
+                        continue
+                    if len(room.members) >= 2:
+                        self._start_room(room)
+                    else:
+                        # Held: no one else arrived. Host can still start when a friend joins.
+                        room.deadline = None
+                        self._broadcast_lobby(room)
+
+    def _lobby_payload(self, room):
+        left = 0
+        if room.deadline is not None:
+            left = max(0, int(room.deadline - time.time()))
+        return json.dumps({
+            "t": "lobby",
+            "code": room.code,
+            "players": room.players_csv(),
+            "cnt": len(room.members),
+            "left": left,
+        })
+
+    def _broadcast_lobby(self, room):
+        room.broadcast(self._lobby_payload(room), self._send_locked)
+
+    def _start_room(self, room):
+        room.started = True
+        room.deadline = None
+        room.all_seats = sorted(room.members.keys())
+        room.seed = random.randint(1, 2147483647)
+        room.current_seat = 0
+        players = room.players_csv()
+        for seat, handler in list(room.members.items()):
+            payload = json.dumps({
+                "t": "start",
+                "seed": room.seed,
+                "s": seat,
+                "players": players,
+                "code": room.code,
+            })
+            self._send_locked(handler, payload)
 
     def register(self, handler):
         with self.lock:
@@ -69,12 +140,32 @@ class Relay:
                 code = info["room_code"]
                 room = self.rooms.get(code)
                 if room:
-                    close_msg = json.dumps({"t": "close"})
-                    room.broadcast(close_msg, self._send_locked)
-                    other = room.guest if handler == room.host else room.host
-                    if other and other in self.clients:
-                        self.clients[other]["room_code"] = None
-                    self.rooms.pop(code, None)
+                    if not room.started:
+                        seat = room.remove(handler)
+                        if seat == 0:
+                            # Host left before the game: close the room for everyone.
+                            close_msg = json.dumps({"t": "close"})
+                            room.broadcast(close_msg, self._send_locked)
+                            for other in list(room.members.values()):
+                                if other in self.clients:
+                                    self.clients[other]["room_code"] = None
+                            self.rooms.pop(code, None)
+                        elif seat is not None:
+                            self._broadcast_lobby(room)
+                    else:
+                        # Mid-game leave: mark the seat offline and let the
+                        # others keep playing. Last player standing wins.
+                        seat = room.remove(handler)
+                        if seat is not None:
+                            room.broadcast(json.dumps({"t": "player_left", "s": seat}), self._send_locked)
+                        remaining = sorted(room.members.keys())
+                        if len(remaining) <= 1:
+                            if remaining:
+                                room.broadcast(json.dumps({"t": "win", "s": remaining[0]}), self._send_locked)
+                            for other in list(room.members.values()):
+                                if other in self.clients:
+                                    self.clients[other]["room_code"] = None
+                            self.rooms.pop(code, None)
 
     def _generate_code(self):
         for _ in range(100):
@@ -98,6 +189,9 @@ class Relay:
         # 1. CREATE PRIVATE ROOM
         if t == "create_room":
             name = str(msg.get("n", "Host"))[:24]
+            if len(name.strip()) < 3:
+                self._send_locked(handler, json.dumps({"t": "room_error", "m": "Name needs at least 3 characters."}))
+                return
             with self.lock:
                 code = self._generate_code()
                 room = Room(code, handler, name)
@@ -106,49 +200,74 @@ class Relay:
                 info["room_code"] = code
                 payload = json.dumps({"t": "room_created", "code": code})
                 self._send_locked(handler, payload)
+                self._broadcast_lobby(room)
             return
 
         # 2. JOIN PRIVATE ROOM
         if t == "join_room":
             code = str(msg.get("code", "")).strip().upper()
             name = str(msg.get("n", "Guest"))[:24]
+            if len(name.strip()) < 3:
+                self._send_locked(handler, json.dumps({"t": "room_error", "m": "Name needs at least 3 characters."}))
+                return
             with self.lock:
                 room = self.rooms.get(code)
                 if not room:
                     self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} not found."}))
                     return
-                if room.guest is not None or room.matched:
-                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} is full."}))
+                if room.started:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} already started."}))
                     return
-                room.guest = handler
-                room.seat_ws[1] = handler
-                room.names[1] = name
-                room.matched = True
-                room.seed = random.randint(1, 2147483647)
-                room.current_seat = 0
+                seat = room.free_seat()
+                if seat is None:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} is full (6 players)."}))
+                    return
+                room.members[seat] = handler
+                room.names[seat] = name
                 info["name"] = name
                 info["room_code"] = code
-
-                host_payload = json.dumps({"t": "matched", "seed": room.seed, "s": 0, "opp": name, "code": code})
-                guest_payload = json.dumps({"t": "matched", "seed": room.seed, "s": 1, "opp": room.names[0], "code": code})
-                self._send_locked(room.host, host_payload)
-                self._send_locked(room.guest, guest_payload)
+                self._broadcast_lobby(room)
+                # If the lobby timer already expired while the host waited alone, start now.
+                if len(room.members) >= 2 and room.deadline is not None and time.time() >= room.deadline:
+                    self._start_room(room)
             return
 
-        # 3. CANCEL ROOM
+        # 3. HOST STARTS THE GAME EARLY
+        if t == "start_game":
+            with self.lock:
+                code = info.get("room_code")
+                room = self.rooms.get(code) if code else None
+                if not room or room.started:
+                    return
+                if room.get_seat(handler) != 0:
+                    return
+                if len(room.members) < 2:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": "Need at least 2 players to start."}))
+                    return
+                self._start_room(room)
+            return
+
+        # 4. CANCEL ROOM
         if t == "cancel_room":
             with self.lock:
                 code = info.get("room_code")
-                if code and code in self.rooms:
-                    room = self.rooms.pop(code)
+                room = self.rooms.get(code) if code else None
+                if room and room.get_seat(handler) == 0:
+                    self.rooms.pop(code, None)
                     info["room_code"] = None
                     close_msg = json.dumps({"t": "close"})
                     room.broadcast(close_msg, self._send_locked)
+                    for other in list(room.members.values()):
+                        if other in self.clients:
+                            self.clients[other]["room_code"] = None
             return
 
-        # 4. QUICK MATCH (Random 1v1)
+        # 5. QUICK MATCH (Random 1v1)
         if t in ("join", "quick_match"):
             name = str(msg.get("n", "Player"))[:24]
+            if len(name.strip()) < 3:
+                self._send_locked(handler, json.dumps({"t": "room_error", "m": "Name needs at least 3 characters."}))
+                return
             with self.lock:
                 info["name"] = name
                 if self.quick_waiting is None or self.quick_waiting == handler:
@@ -171,25 +290,17 @@ class Relay:
                         if host_info:
                             host_info["room_code"] = code
 
-                    room.guest = handler
-                    room.seat_ws[1] = handler
+                    room.members[1] = handler
                     room.names[1] = name
-                    room.matched = True
-                    room.seed = random.randint(1, 2147483647)
-                    room.current_seat = 0
                     info["room_code"] = code
-
-                    host_payload = json.dumps({"t": "matched", "seed": room.seed, "s": 0, "opp": name, "code": code})
-                    guest_payload = json.dumps({"t": "matched", "seed": room.seed, "s": 1, "opp": room.names[0], "code": code})
-                    self._send_locked(room.host, host_payload)
-                    self._send_locked(room.guest, guest_payload)
+                    self._start_room(room)
             return
 
-        # 5. IN-GAME ACTIONS (move, win, chat)
+        # 6. IN-GAME ACTIONS (move, win, chat)
         with self.lock:
             code = info.get("room_code")
             room = self.rooms.get(code)
-            if not room:
+            if not room or not room.started:
                 return
             seat = room.get_seat(handler)
             if seat is None:
@@ -197,9 +308,12 @@ class Relay:
 
         if t == "move":
             with self.lock:
-                next_seat = msg.get("ns", 1 - seat)
-                if next_seat not in (0, 1):
-                    next_seat = 1 - seat
+                # Validate ns against the seats the game started with, not the
+                # current member count (mid-game leaves shrink members).
+                seat_count = (max(room.all_seats) + 1) if room.all_seats else 2
+                next_seat = msg.get("ns")
+                if not isinstance(next_seat, int) or next_seat < 0 or next_seat >= seat_count:
+                    next_seat = (seat + 1) % max(2, seat_count)
                 room.current_seat = next_seat
                 out = dict(msg)
                 out["t"] = "move"
@@ -329,7 +443,35 @@ class GameHandler(http.server.SimpleHTTPRequestHandler):
         if parsed == "/ws":
             self.handle_websocket()
             return
+        if parsed == "/debug/rooms":
+            self.send_debug_rooms()
+            return
         super().do_GET()
+
+    def send_debug_rooms(self):
+        # Local development helper: only answer on loopback connections.
+        if self.client_address[0] not in ("127.0.0.1", "::1", "localhost"):
+            self.send_error(http.HTTPStatus.FORBIDDEN)
+            return
+        with RELAY.lock:
+            rooms = {}
+            now = time.time()
+            for code, room in RELAY.rooms.items():
+                left = None
+                if room.deadline is not None:
+                    left = max(0, int(room.deadline - now))
+                rooms[code] = {
+                    "players": [room.names.get(s, "") for s in sorted(room.members)],
+                    "started": room.started,
+                    "left": left,
+                }
+        payload = json.dumps({"rooms": rooms}).encode("utf-8")
+        self.send_response(http.HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        http.server.SimpleHTTPRequestHandler.end_headers(self)
+        self.wfile.write(payload)
 
     # ---- WebSocket upgrade + relay (same port, works through HTTP tunnels) ----
     def handle_websocket(self):
