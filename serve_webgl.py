@@ -25,8 +25,10 @@ MAX_PLAYERS = 6
 class Room:
     """A private room lobby: host (seat 0) + up to 5 joiners, then a shared game."""
 
-    def __init__(self, code, host_handler, host_name="Host"):
+    def __init__(self, code, host_handler, host_name="Host", mode="Classic", capacity=4):
         self.code = code
+        self.mode = mode
+        self.capacity = capacity
         self.members = {0: host_handler}  # seat -> handler
         self.names = {0: host_name}       # seat -> display name
         self.started = False
@@ -49,7 +51,8 @@ class Room:
         return connected[0]
 
     def free_seat(self):
-        for s in range(MAX_PLAYERS):
+        cap = getattr(self, "capacity", MAX_PLAYERS)
+        for s in range(cap):
             if s not in self.members:
                 return s
         return None
@@ -112,7 +115,7 @@ class Relay:
                             room.deadline = None
                             self._broadcast_lobby(room)
                     else:
-                        # In-game turn timeout check (18s: 15s turn limit + 3s network grace period)
+                        # In-game turn timeout check (Classic: 15s + 3s grace = 18s; Blitz: 8s + 3s grace = 11s)
                         if room.turn_deadline is not None and time.time() >= room.turn_deadline:
                             fin = getattr(room, "finished_seats", set())
                             active = [s for s in room.members.keys() if s not in fin]
@@ -120,7 +123,9 @@ class Relay:
                                 cur_seat = room.current_seat
                                 next_s = room.next_seat(cur_seat)
                                 room.current_seat = next_s
-                                room.turn_deadline = time.time() + 18.0
+                                r_mode = getattr(room, "mode", "Classic")
+                                is_blitz = (r_mode.lower() == "blitz" or r_mode == "Blitz Mode")
+                                room.turn_deadline = time.time() + (11.0 if is_blitz else 18.0)
                                 auto_pass = {
                                     "t": "move",
                                     "s": cur_seat,
@@ -151,15 +156,19 @@ class Relay:
         host_s = getattr(room, "host_seat", 0)
         csv = room.players_csv()
         cnt = len(room.members)
+        r_mode = getattr(room, "mode", "Classic")
+        r_cap = getattr(room, "capacity", 4)
         for seat, handler in list(room.members.items()):
             payload = json.dumps({
                 "t": "lobby",
                 "code": room.code,
                 "players": csv,
                 "cnt": cnt,
+                "cap": r_cap,
                 "left": left,
                 "host": host_s,
                 "s": seat,
+                "mode": r_mode,
             })
             self._send_locked(handler, payload)
 
@@ -169,16 +178,21 @@ class Relay:
         room.finished_seats = set()
         room.all_seats = sorted(room.members.keys())
         room.seed = random.randint(1, 2147483647)
-        room.current_seat = sorted(room.members.keys())[0] if room.members else 0
-        room.turn_deadline = time.time() + 18.0
+        active_seats = sorted(room.members.keys())
+        room.current_seat = random.choice(active_seats) if active_seats else 0
+        r_mode = getattr(room, "mode", "Classic")
+        is_blitz = (r_mode.lower() == "blitz" or r_mode == "Blitz Mode")
+        room.turn_deadline = time.time() + (11.0 if is_blitz else 18.0)
         players = room.players_csv()
         for seat, handler in list(room.members.items()):
             payload = json.dumps({
                 "t": "start",
                 "seed": room.seed,
                 "s": seat,
+                "lead": room.current_seat,
                 "players": players,
                 "code": room.code,
+                "mode": r_mode,
             })
             self._send_locked(handler, payload)
 
@@ -257,16 +271,23 @@ class Relay:
         # 1. CREATE PRIVATE ROOM
         if t == "create_room":
             name = str(msg.get("n", "Host"))[:24]
+            mode = str(msg.get("mode", "Classic"))[:32]
+            try:
+                cap = int(msg.get("cap", msg.get("cnt", 4)))
+            except Exception:
+                cap = 4
+            if cap not in (2, 3, 4, 5, 6):
+                cap = 4
             if len(name.strip()) < 3:
                 self._send_locked(handler, json.dumps({"t": "room_error", "m": "Name needs at least 3 characters."}))
                 return
             with self.lock:
                 code = self._generate_code()
-                room = Room(code, handler, name)
+                room = Room(code, handler, name, mode=mode, capacity=cap)
                 self.rooms[code] = room
                 info["name"] = name
                 info["room_code"] = code
-                payload = json.dumps({"t": "room_created", "code": code, "s": 0, "host": 0})
+                payload = json.dumps({"t": "room_created", "code": code, "s": 0, "host": 0, "mode": mode, "cap": cap})
                 self._send_locked(handler, payload)
                 self._broadcast_lobby(room)
             return
@@ -288,13 +309,20 @@ class Relay:
                     return
                 seat = room.free_seat()
                 if seat is None:
-                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} is full (6 players)."}))
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} is full ({getattr(room, 'capacity', 4)} players)."}))
                     return
                 room.members[seat] = handler
                 room.names[seat] = name
                 info["name"] = name
                 info["room_code"] = code
-                self._send_locked(handler, json.dumps({"t": "room_joined", "code": code, "s": seat, "host": getattr(room, "host_seat", 0)}))
+                self._send_locked(handler, json.dumps({
+                    "t": "room_joined",
+                    "code": code,
+                    "s": seat,
+                    "host": getattr(room, "host_seat", 0),
+                    "mode": getattr(room, "mode", "Classic"),
+                    "cap": getattr(room, "capacity", 4),
+                }))
                 self._broadcast_lobby(room)
                 # If the lobby timer already expired while the host waited alone, start now.
                 if len(room.members) >= 2 and room.deadline is not None and time.time() >= room.deadline:
@@ -423,7 +451,9 @@ class Relay:
                 if not isinstance(next_seat, int) or next_seat < 0 or next_seat >= seat_count:
                     next_seat = (seat + 1) % max(2, seat_count)
                 room.current_seat = next_seat
-                room.turn_deadline = time.time() + 18.0
+                r_mode = getattr(room, "mode", "Classic")
+                is_blitz = (r_mode.lower() == "blitz" or r_mode == "Blitz Mode")
+                room.turn_deadline = time.time() + (11.0 if is_blitz else 18.0)
                 out = dict(msg)
                 out["t"] = "move"
                 out["s"] = seat
