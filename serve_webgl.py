@@ -29,7 +29,7 @@ class Room:
         self.code = code
         self.mode = mode
         self.capacity = capacity
-        self.members = {0: host_handler}  # seat -> handler
+        self.members = {0: host_handler}  # seat -> handler (None if temporarily disconnected)
         self.names = {0: host_name}       # seat -> display name
         self.started = False
         self.seed = None
@@ -39,16 +39,17 @@ class Room:
         self.turn_deadline = None
         self.finished_seats = set()
         self.host_seat = 0
+        self.disconnected = {}  # seat -> {"deadline": float, "name": str}
 
     def next_seat(self, from_seat):
         fin = getattr(self, "finished_seats", set())
-        connected = [s for s in sorted(self.members.keys()) if s not in fin]
-        if not connected:
+        valid = [s for s in sorted(self.members.keys()) if s not in fin]
+        if not valid:
             return 0
-        for s in connected:
+        for s in valid:
             if s > from_seat:
                 return s
-        return connected[0]
+        return valid[0]
 
     def free_seat(self):
         cap = getattr(self, "capacity", MAX_PLAYERS)
@@ -59,7 +60,7 @@ class Room:
 
     def get_seat(self, handler):
         for s, h in self.members.items():
-            if h == handler:
+            if h is not None and h == handler:
                 return s
         return None
 
@@ -69,18 +70,25 @@ class Room:
             return None
         self.members.pop(seat, None)
         self.names.pop(seat, None)
+        if hasattr(self, "disconnected"):
+            self.disconnected.pop(seat, None)
         if hasattr(self, "finished_seats"):
             self.finished_seats.discard(seat)
         if seat == getattr(self, "host_seat", 0) and self.members:
-            self.host_seat = min(self.members.keys())
+            valid_seats = [s for s, h in self.members.items() if h is not None]
+            if valid_seats:
+                self.host_seat = min(valid_seats)
+            elif self.members:
+                self.host_seat = min(self.members.keys())
         return seat
 
     def players_csv(self):
-        return ",".join(self.names.get(s, "") for s in sorted(self.members))
+        return ",".join(self.names.get(s, "") for s in sorted(self.names.keys()))
 
     def broadcast(self, payload, send_fn):
         for h in list(self.members.values()):
-            send_fn(h, payload)
+            if h is not None:
+                send_fn(h, payload)
 
 
 class Relay:
@@ -115,10 +123,57 @@ class Relay:
                             room.deadline = None
                             self._broadcast_lobby(room)
                     else:
-                        # In-game turn timeout check (Classic: 15s + 3s grace = 18s; Blitz: 8s + 3s grace = 11s)
+                        # 1. In-game disconnect grace period check (25-second reconnect window)
+                        if hasattr(room, "disconnected") and room.disconnected:
+                            now = time.time()
+                            for d_seat in list(room.disconnected.keys()):
+                                d_info = room.disconnected[d_seat]
+                                if now >= d_info["deadline"]:
+                                    # 25 seconds grace expired! Finalize forfeit
+                                    room.disconnected.pop(d_seat, None)
+                                    room.members.pop(d_seat, None)
+                                    d_name = room.names.pop(d_seat, d_info.get("name", "Player"))
+                                    if hasattr(room, "finished_seats"):
+                                        room.finished_seats.discard(d_seat)
+
+                                    room.broadcast(json.dumps({
+                                        "t": "player_left",
+                                        "s": d_seat,
+                                        "n": d_name,
+                                        "timeout": True
+                                    }), self._send_locked)
+
+                                    fin = getattr(room, "finished_seats", set())
+                                    active = [s for s, h in room.members.items() if h is not None and s not in fin]
+                                    if len(active) <= 1:
+                                        if active:
+                                            room.broadcast(json.dumps({"t": "win", "s": active[0]}), self._send_locked)
+
+                                    if not room.members or not any(h is not None for h in room.members.values()):
+                                        self.rooms.pop(room.code, None)
+                                    elif room.current_seat == d_seat:
+                                        next_s = room.next_seat(d_seat)
+                                        room.current_seat = next_s
+                                        r_mode = getattr(room, "mode", "Classic")
+                                        is_blitz = (r_mode.lower() == "blitz" or r_mode == "Blitz Mode")
+                                        room.turn_deadline = time.time() + (11.0 if is_blitz else 18.0)
+                                        auto_pass = {
+                                            "t": "move",
+                                            "s": d_seat,
+                                            "k": "pass",
+                                            "ns": next_s,
+                                            "id": -98,
+                                            "left": True,
+                                        }
+                                        room.broadcast(json.dumps(auto_pass), self._send_locked)
+
+                        # 2. In-game turn timeout check (Classic: 15s + 3s grace = 18s; Blitz: 8s + 3s grace = 11s)
                         if room.turn_deadline is not None and time.time() >= room.turn_deadline:
+                            # Do not auto-pass turn if someone in the room is actively in 25s reconnect grace!
+                            if hasattr(room, "disconnected") and room.disconnected:
+                                continue
                             fin = getattr(room, "finished_seats", set())
-                            active = [s for s in room.members.keys() if s not in fin]
+                            active = [s for s, h in room.members.items() if h is not None and s not in fin]
                             if len(active) >= 2:
                                 cur_seat = room.current_seat
                                 next_s = room.next_seat(cur_seat)
@@ -223,31 +278,27 @@ class Relay:
                         elif seat is not None:
                             self._broadcast_lobby(room)
                     else:
-                        # Mid-game leave: mark the seat offline and let the
-                        # others keep playing. Last player standing wins.
-                        seat = room.remove(handler)
+                        # Mid-game disconnect: do NOT immediately forfeit!
+                        # Mark seat as disconnected and give a 25-second grace period for reconnection.
+                        seat = room.get_seat(handler)
                         if seat is not None:
-                            room.broadcast(json.dumps({"t": "player_left", "s": seat}), self._send_locked)
-                        remaining = sorted(room.members.keys())
-                        if len(remaining) <= 1:
-                            if remaining:
-                                room.broadcast(json.dumps({"t": "win", "s": remaining[0]}), self._send_locked)
-                        if not room.members:
-                            self.rooms.pop(code, None)
-                        elif room.current_seat == seat:
-                            # Active player left mid-turn! Advance turn immediately
-                            next_s = room.next_seat(seat)
-                            room.current_seat = next_s
-                            room.turn_deadline = time.time() + 18.0
-                            auto_pass = {
-                                "t": "move",
-                                "s": seat,
-                                "k": "pass",
-                                "ns": next_s,
-                                "id": -98,
-                                "left": True,
+                            name = room.names.get(seat, "Player")
+                            room.members[seat] = None
+                            if not hasattr(room, "disconnected"):
+                                room.disconnected = {}
+                            deadline = time.time() + 25.0
+                            room.disconnected[seat] = {
+                                "deadline": deadline,
+                                "name": name
                             }
-                            room.broadcast(json.dumps(auto_pass), self._send_locked)
+                            disconnect_msg = json.dumps({
+                                "t": "player_disconnected",
+                                "s": seat,
+                                "n": name,
+                                "grace": 25,
+                                "cur": room.current_seat
+                            })
+                            room.broadcast(disconnect_msg, self._send_locked)
 
     def _generate_code(self):
         for _ in range(100):
@@ -391,7 +442,7 @@ class Relay:
                 self._broadcast_lobby(room)
             return
 
-        # 4c. LEAVE ROOM (Lobby or In-Game)
+        # 4c. LEAVE ROOM (Lobby or In-Game intentional leave)
         if t in ("leave_room", "leave"):
             with self.lock:
                 code = info.get("room_code")
@@ -400,12 +451,78 @@ class Relay:
                     seat = room.remove(handler)
                     info["room_code"] = None
                     if seat is not None:
-                        room.broadcast(json.dumps({"t": "player_left", "s": seat}), self._send_locked)
+                        if hasattr(room, "disconnected"):
+                            room.disconnected.pop(seat, None)
+                        room.broadcast(json.dumps({"t": "player_left", "s": seat, "intentional": True}), self._send_locked)
                         if not room.started:
                             self._broadcast_lobby(room)
-                    if not room.members:
+                        else:
+                            fin = getattr(room, "finished_seats", set())
+                            active = [s for s, h in room.members.items() if h is not None and s not in fin]
+                            if len(active) <= 1:
+                                if active:
+                                    room.broadcast(json.dumps({"t": "win", "s": active[0]}), self._send_locked)
+                    if not room.members or not any(h is not None for h in room.members.values()):
                         self.rooms.pop(code, None)
                 self._send_locked(handler, json.dumps({"t": "left_room"}))
+            return
+
+        # 4d. RECONNECT TO ACTIVE GAME (within 25s grace period)
+        if t == "reconnect":
+            code = str(msg.get("code", "")).strip().upper()
+            seat = msg.get("s")
+            name = str(msg.get("n", "Player"))[:24]
+            with self.lock:
+                room = self.rooms.get(code)
+                if not room or not room.started:
+                    self._send_locked(handler, json.dumps({
+                        "t": "reconnect_failed",
+                        "m": "Game is no longer active."
+                    }))
+                    return
+
+                all_s = getattr(room, "all_seats", list(room.members.keys()))
+                if not isinstance(seat, int) or (seat not in all_s and seat not in room.members):
+                    self._send_locked(handler, json.dumps({
+                        "t": "reconnect_failed",
+                        "m": "Invalid seat for this match."
+                    }))
+                    return
+
+                if hasattr(room, "disconnected") and seat in room.disconnected:
+                    room.disconnected.pop(seat, None)
+
+                room.members[seat] = handler
+                room.names[seat] = name
+                info["name"] = name
+                info["room_code"] = code
+
+                r_mode = getattr(room, "mode", "Classic")
+                players = room.players_csv()
+                turn_left = 0
+                if room.turn_deadline is not None:
+                    turn_left = max(1, int(room.turn_deadline - time.time()))
+
+                self._send_locked(handler, json.dumps({
+                    "t": "reconnected",
+                    "code": room.code,
+                    "s": seat,
+                    "cur": room.current_seat,
+                    "lead": room.current_seat,
+                    "players": players,
+                    "mode": r_mode,
+                    "left": turn_left
+                }))
+
+                reconnected_notice = json.dumps({
+                    "t": "player_reconnected",
+                    "s": seat,
+                    "n": name,
+                    "cur": room.current_seat
+                })
+                for s, h in room.members.items():
+                    if s != seat and h is not None:
+                        self._send_locked(h, reconnected_notice)
             return
 
         # 5. QUICK MATCH (Random 1v1)
