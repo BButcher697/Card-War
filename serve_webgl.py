@@ -263,6 +263,16 @@ class Relay:
             return
         t = msg.get("t")
 
+        # Instant Ping / Pong for latency measurement
+        if t == "ping":
+            resp = {"t": "pong"}
+            if "ts" in msg:
+                resp["ts"] = msg["ts"]
+            if "id" in msg:
+                resp["id"] = msg["id"]
+            self._send_locked(handler, json.dumps(resp))
+            return
+
         with self.lock:
             info = self.clients.get(handler)
             if not info:
