@@ -53,9 +53,17 @@ class Room:
 
     def free_seat(self):
         cap = getattr(self, "capacity", MAX_PLAYERS)
-        for s in range(cap):
-            if s not in self.members:
+        # First preference: non-host seats that haven't been taken
+        for s in range(1, cap):
+            if s not in self.members and s not in self.names:
                 return s
+        # Second preference: non-host seats where connection dropped
+        for s in range(1, cap):
+            if self.members.get(s) is None:
+                return s
+        # Fallback: seat 0 only if never taken
+        if 0 not in self.members and 0 not in self.names:
+            return 0
         return None
 
     def get_seat(self, handler):
@@ -107,21 +115,41 @@ class Relay:
         self._timer_thread.start()
 
     def _timer_loop(self):
+        last_heartbeat = 0.0
         while True:
             time.sleep(0.5)
+            now = time.time()
             with self.lock:
+                # 0. Broadcast keepalive heartbeat every 15s to keep reverse proxies (Render, Cloudflare) alive
+                if now - last_heartbeat >= 15.0:
+                    last_heartbeat = now
+                    hb_msg = json.dumps({"t": "hb"})
+                    for client_handler in list(self.clients.keys()):
+                        try:
+                            self._send_locked(client_handler, hb_msg)
+                        except Exception:
+                            pass
+
                 for room in list(self.rooms.values()):
                     if not room.started:
                         if room.deadline is None:
+                            # Room held after 5-minute timer (e.g. host alone). If everyone left, clean up.
+                            if not any(h is not None for h in room.members.values()):
+                                self.rooms.pop(room.code, None)
                             continue
-                        if time.time() < room.deadline:
+                        if now < room.deadline:
                             continue
-                        if len(room.members) >= 2:
+                        # 5-minute lobby timer expired
+                        connected_players = [s for s, h in room.members.items() if h is not None]
+                        if len(connected_players) >= 2:
                             self._start_room(room)
-                        else:
-                            # Held: no one else arrived. Host can still start when a friend joins.
+                        elif len(connected_players) == 1:
+                            # Hold room so host can still start when someone joins
                             room.deadline = None
                             self._broadcast_lobby(room)
+                        else:
+                            # 0 players connected and 5 minutes expired -> clean up dead room
+                            self.rooms.pop(room.code, None)
                     else:
                         # 1. In-game disconnect grace period check (25-second reconnect window)
                         if hasattr(room, "disconnected") and room.disconnected:
@@ -210,22 +238,23 @@ class Relay:
             left = max(0, int(room.deadline - time.time()))
         host_s = getattr(room, "host_seat", 0)
         csv = room.players_csv()
-        cnt = len(room.members)
+        cnt = len(room.names)
         r_mode = getattr(room, "mode", "Classic")
         r_cap = getattr(room, "capacity", 4)
         for seat, handler in list(room.members.items()):
-            payload = json.dumps({
-                "t": "lobby",
-                "code": room.code,
-                "players": csv,
-                "cnt": cnt,
-                "cap": r_cap,
-                "left": left,
-                "host": host_s,
-                "s": seat,
-                "mode": r_mode,
-            })
-            self._send_locked(handler, payload)
+            if handler is not None:
+                payload = json.dumps({
+                    "t": "lobby",
+                    "code": room.code,
+                    "players": csv,
+                    "cnt": cnt,
+                    "cap": r_cap,
+                    "left": left,
+                    "host": host_s,
+                    "s": seat,
+                    "mode": r_mode,
+                })
+                self._send_locked(handler, payload)
 
     def _start_room(self, room):
         room.started = True
@@ -266,16 +295,12 @@ class Relay:
                 room = self.rooms.get(code)
                 if room:
                     if not room.started:
-                        seat = room.remove(handler)
-                        if seat == 0:
-                            # Host left before the game: close the room for everyone.
-                            close_msg = json.dumps({"t": "close"})
-                            room.broadcast(close_msg, self._send_locked)
-                            for other in list(room.members.values()):
-                                if other in self.clients:
-                                    self.clients[other]["room_code"] = None
-                            self.rooms.pop(code, None)
-                        elif seat is not None:
+                        # In the 5-minute lobby: do NOT delete the room or close it!
+                        # A player's connection may drop temporarily (background tab, mobile sleep, network switch).
+                        # The room must persist in self.rooms for the full 5-minute deadline.
+                        seat = room.get_seat(handler)
+                        if seat is not None:
+                            room.members[seat] = None
                             self._broadcast_lobby(room)
                     else:
                         # Mid-game disconnect: do NOT immediately forfeit!
@@ -388,6 +413,53 @@ class Relay:
                 # If the lobby timer already expired while the host waited alone, start now.
                 if len(room.members) >= 2 and room.deadline is not None and time.time() >= room.deadline:
                     self._start_room(room)
+            return
+
+        # 2b. REJOIN PRIVATE ROOM LOBBY (Host or guest reconnecting during 5-minute lobby window)
+        if t == "rejoin_lobby":
+            code = str(msg.get("code", "")).strip().upper()
+            target_seat = msg.get("s")
+            name = str(msg.get("n", "Player"))[:24]
+            with self.lock:
+                room = self.rooms.get(code)
+                if not room:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} not found."}))
+                    return
+                if room.started:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} already started."}))
+                    return
+
+                assigned_seat = None
+                if target_seat is not None and isinstance(target_seat, int) and 0 <= target_seat < getattr(room, "capacity", 4):
+                    cur_h = room.members.get(target_seat)
+                    if cur_h is None or cur_h == handler:
+                        assigned_seat = target_seat
+
+                if assigned_seat is None:
+                    assigned_seat = room.free_seat()
+
+                if assigned_seat is None:
+                    self._send_locked(handler, json.dumps({"t": "room_error", "m": f"Room {code} is full."}))
+                    return
+
+                room.members[assigned_seat] = handler
+                room.names[assigned_seat] = name
+                info["name"] = name
+                info["room_code"] = code
+
+                host_s = getattr(room, "host_seat", 0)
+                r_mode = getattr(room, "mode", "Classic")
+                r_cap = getattr(room, "capacity", 4)
+
+                self._send_locked(handler, json.dumps({
+                    "t": "room_joined",
+                    "code": code,
+                    "s": assigned_seat,
+                    "host": host_s,
+                    "mode": r_mode,
+                    "cap": r_cap,
+                }))
+                self._broadcast_lobby(room)
             return
 
         # 3. HOST STARTS THE GAME EARLY
@@ -775,7 +847,7 @@ class GameHandler(http.server.SimpleHTTPRequestHandler):
         except OSError:
             pass
         try:
-            conn.settimeout(120.0)
+            conn.settimeout(360.0)
             while True:
                 frame = self.recv_frame(conn)
                 if frame is None:
