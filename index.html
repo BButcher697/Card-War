@@ -6,6 +6,7 @@
     <title>Unity Web Player | Card Wars</title>
     <link rel="shortcut icon" href="TemplateData/favicon.ico">
     <link rel="stylesheet" href="TemplateData/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Lilita+One&family=Nunito:wght@700;800&display=swap" rel="stylesheet">
   <!-- CARDWARS MOBILE START -->
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <style>
@@ -66,13 +67,154 @@
     touch-action: none;
     image-rendering: auto !important;
   }
-  #unity-footer, .unity-footer, #unity-build-title, #unity-logo-title-footer {
+  #unity-footer, .unity-footer, #unity-build-title, #unity-logo-title-footer, #unity-loading-container, #unity-loading-bar {
     display: none !important;
   }
-  #unity-loading-bar {
-    left: 50% !important;
-    top: 50% !important;
-    transform: translate(-50%, -50%) !important;
+
+  /* ---- Card Wars Arcade Primary Game Loader ---- */
+  #cw-loader {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: radial-gradient(120% 75% at 50% 38%, rgba(255,255,255,.25), rgba(0,0,0,.38)), repeating-conic-gradient(from 0deg at 50% 38%, #3F97EE 0 7.5deg, #2E80DC 7.5deg 15deg);
+    transition: opacity 0.4s ease-out;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .cw-loader-wrap {
+    width: 100%;
+    max-width: 390px;
+    height: 100%;
+    max-height: 844px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 72px 24px 56px;
+    position: relative;
+  }
+  .cw-loader-bot {
+    margin-top: auto;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+  }
+  .f { font-family: "Lilita One", sans-serif; font-weight: 400; }
+  .st {
+    text-shadow:
+      -2px -2px 0 #1B1B22,  2px -2px 0 #1B1B22,
+      -2px  2px 0 #1B1B22,  2px  2px 0 #1B1B22,
+       0px -2px 0 #1B1B22,  0px  2px 0 #1B1B22,
+      -2px  0px 0 #1B1B22,  2px  0px 0 #1B1B22,
+       0px  4px 0 #1B1B22;
+  }
+  .ld-logo {
+    font-size: 76px;
+    line-height: 0.88;
+    text-align: center;
+    transform: rotate(-4deg);
+    color: #FFFFFF;
+    margin-top: 16px;
+    text-shadow:
+      -3px -3px 0 #1B1B22,  3px -3px 0 #1B1B22,
+      -3px  3px 0 #1B1B22,  3px  3px 0 #1B1B22,
+       0px -3px 0 #1B1B22,  0px  3px 0 #1B1B22,
+      -3px  0px 0 #1B1B22,  3px  0px 0 #1B1B22,
+       0px  6px 0 #1B1B22;
+    animation: ld-float 3s ease-in-out infinite alternate;
+  }
+  .ld-fan {
+    position: relative;
+    width: 200px;
+    height: 140px;
+    margin-top: 48px;
+    animation: ld-bob 1.2s ease-in-out infinite alternate;
+  }
+  .ld-fan .cd {
+    position: absolute;
+    left: 65px;
+    top: 15px;
+    width: 70px;
+    height: 100px;
+    box-sizing: border-box;
+    border: 3px solid #1B1B22;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(180deg, rgba(255,255,255,.3), rgba(255,255,255,0) 35%), var(--c);
+    box-shadow: inset 0 -6px 0 rgba(0,0,0,.2), 0 5px 0 #1B1B22;
+    font: 400 28px "Lilita One", sans-serif;
+    transform-origin: 50% 115%;
+    animation: ld-fan 1.6s ease-in-out infinite;
+  }
+  .ld-fan .cd:nth-child(1) { --a: -30deg; }
+  .ld-fan .cd:nth-child(2) { --a: 0deg; }
+  .ld-fan .cd:nth-child(3) { --a: 30deg; }
+  .ld-fan .cd .ov {
+    width: 74%;
+    height: 62%;
+    border: 3px solid #1B1B22;
+    border-radius: 50%;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transform: rotate(-18deg);
+    color: var(--t);
+  }
+  .cr { --c: #E8343A; --t: #C2262C; }
+  .cb { --c: #2E8BEA; --t: #1B6BC4; }
+  .cg { --c: #2DBE5A; --t: #1E8F42; }
+
+  .ld-lbl {
+    font-size: 26px;
+    color: #FFFFFF;
+    letter-spacing: 1px;
+  }
+  .ld-bar {
+    width: 100%;
+    max-width: 320px;
+    height: 34px;
+    box-sizing: border-box;
+    background: #2A2A32;
+    border: 3px solid #1B1B22;
+    border-radius: 12px;
+    box-shadow: inset 0 0 0 3px #50505B, 0 4px 0 #1B1B22;
+    overflow: hidden;
+    padding: 4px;
+  }
+  .ld-fill {
+    display: block;
+    height: 100%;
+    width: 6%;
+    box-sizing: border-box;
+    border-radius: 6px;
+    border: 2px solid #1B1B22;
+    background-color: #2DBE5A;
+    background-image: linear-gradient(135deg, rgba(255,255,255,.28) 25%, transparent 25% 50%, rgba(255,255,255,.28) 50% 75%, transparent 75%);
+    background-size: 40px 40px;
+    box-shadow: inset 0 3px 0 rgba(255,255,255,.35);
+    animation: ld-stripes .8s linear infinite;
+    transition: width 0.25s ease-out;
+  }
+  @keyframes ld-float { from { transform: rotate(-4deg) translateY(-6px); } to { transform: rotate(-4deg) translateY(6px); } }
+  @keyframes ld-bob { from { transform: translateY(-4px); } to { transform: translateY(4px); } }
+  @keyframes ld-fan { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(var(--a)); } }
+  @keyframes ld-dot { 0%, 20% { opacity: 0; } 40%, 100% { opacity: 1; } }
+  @keyframes ld-stripes { to { background-position: 40px 0; } }
+  .ld-dots span { animation: ld-dot 1.2s infinite; }
+  .ld-dots span:nth-child(2) { animation-delay: .2s; }
+  .ld-dots span:nth-child(3) { animation-delay: .4s; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .ld-logo, .ld-fan, .ld-fan .cd, .ld-fill, .ld-dots span { animation: none !important; }
+    .ld-dots span { opacity: 1; }
   }
 </style>
 <!-- CARDWARS MOBILE END -->
@@ -81,11 +223,17 @@
     <div id="unity-container" class="unity-desktop">
       <div id="unity-fullscreen-container">
         <canvas id="unity-canvas" width="1080" height="1920" tabindex="-1"></canvas>
-        <div id="unity-loading-container">
-          <div id="unity-loading-bar">
-            <div id="unity-logo"></div>
-            <div id="unity-progress-bar-empty">
-              <div id="unity-progress-bar-full"></div>
+        <div id="cw-loader">
+          <div class="cw-loader-wrap">
+            <div class="f st ld-logo">CARD<br><span style="color:#FFC31F">WARS</span></div>
+            <div class="ld-fan" aria-hidden="true">
+              <div class="cd cg"><b class="ov">5</b></div>
+              <div class="cd cr"><b class="ov">7</b></div>
+              <div class="cd cb"><b class="ov">3</b></div>
+            </div>
+            <div class="cw-loader-bot" role="status" aria-label="Loading">
+              <div class="f st ld-lbl">LOADING<span class="ld-dots"><span>.</span><span>.</span><span>.</span></span></div>
+              <div class="ld-bar"><i class="ld-fill" id="cw-progress-fill"></i></div>
             </div>
           </div>
         </div>
@@ -129,7 +277,7 @@
       var buildUrl = "Build";
       var loaderUrl = buildUrl + "/render-deploy.loader.js";
       var config = {
-        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 3),
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 1.6),
         arguments: [],
         dataUrl: buildUrl + "/render-deploy.data",
         frameworkUrl: buildUrl + "/render-deploy.framework.js",
@@ -191,25 +339,34 @@
       var script = document.createElement("script");
       script.src = loaderUrl;
       script.onload = () => {
-        const loadingContainer = document.querySelector("#unity-loading-container");
-        const progressBarFull = document.querySelector("#unity-progress-bar-full");
+        const cwLoader = document.querySelector("#cw-loader");
+        const cwProgressFill = document.querySelector("#cw-progress-fill");
 
         createUnityInstance(canvas, config, (progress) => {
-          if (progress < 1) {
-            loadingContainer.style.display = "block";
-            progressBarFull.style.width = 100 * progress + "%";
-          } else {
-            loadingContainer.style.display = "none";
+          if (cwProgressFill) {
+            cwProgressFill.style.width = Math.min(100, Math.max(6, Math.round(progress * 100))) + "%";
           }
         }).then((unityInstance) => {
-                document.querySelector("#unity-fullscreen-button").onclick = () => {
-                  unityInstance.SetFullscreen(1);
-                };
-
-              }).catch((message) => {
-                alert(message);
-              });
+          if (cwProgressFill) {
+            cwProgressFill.style.width = "100%";
+          }
+          if (cwLoader) {
+            cwLoader.style.opacity = "0";
+            cwLoader.style.pointerEvents = "none";
+            setTimeout(function() {
+              cwLoader.style.display = "none";
+            }, 400);
+          }
+          var fsBtn = document.querySelector("#unity-fullscreen-button");
+          if (fsBtn) {
+            fsBtn.onclick = () => {
+              unityInstance.SetFullscreen(1);
             };
+          }
+        }).catch((message) => {
+          alert(message);
+        });
+      };
 
       document.body.appendChild(script);
 
