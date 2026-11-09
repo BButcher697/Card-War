@@ -503,18 +503,15 @@ class Relay:
                 if seat is None:
                     return
 
-                # If the room has at least 2 players, start a fresh match immediately!
-                # This gives a seamless instant rematch rather than sending players back to the waiting lobby.
-                if len(room.clients) >= 2:
-                    self._start_room(room)
-                else:
-                    if room.started:
-                        room.started = False
-                        if hasattr(room, "finished_seats"):
-                            room.finished_seats.clear()
-                        room.deadline = time.time() + LOBBY_SECONDS
-                        room.turn_deadline = None
-                    self._broadcast_lobby(room)
+                # Reset room back to lobby mode with 5 minute timer
+                if room.started:
+                    room.started = False
+                    if hasattr(room, "finished_seats"):
+                        room.finished_seats.clear()
+                    room.deadline = time.time() + LOBBY_SECONDS
+                    room.turn_deadline = None
+
+                self._broadcast_lobby(room)
             return
 
         # 4c. LEAVE ROOM (Lobby or In-Game intentional leave)
